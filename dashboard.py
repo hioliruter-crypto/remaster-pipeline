@@ -207,67 +207,102 @@ def fetch_metadata(video_id: str, revolver: KeyRevolver) -> tuple[Optional[dict]
 
 def fetch_transcript(video_id: str) -> tuple[Optional[str], Optional[PipelineError]]:
     """
-    Fetch transcript with timecodes. Priority: manual en → auto en → any.
+    Fetch transcript with timecodes.
+    Supports both old (<=0.6.1) and new (>=0.6.2) versions of youtube-transcript-api.
+    Priority: English → any available language.
     Returns (formatted_transcript, None) or (None, PipelineError).
     """
-    from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
-
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-
-        transcript_obj = None
-        source_label = ""
-
-        # Priority 1: manual English
-        try:
-            transcript_obj = transcript_list.find_manually_created_transcript(["en"])
-            source_label = "Manual (en)"
-        except NoTranscriptFound:
-            pass
-
-        # Priority 2: auto English
-        if not transcript_obj:
-            try:
-                transcript_obj = transcript_list.find_generated_transcript(["en"])
-                source_label = "Auto-generated (en)"
-            except NoTranscriptFound:
-                pass
-
-        # Priority 3: any available
-        if not transcript_obj:
-            available = list(transcript_list)
-            if available:
-                transcript_obj = available[0]
-                source_label = f"Auto ({transcript_obj.language_code})"
-            else:
-                return None, PipelineError(
-                    stage="Transcript",
-                    message="Субтитры не найдены ни на одном языке.",
-                    recoverable=False,
-                )
-
-        raw_entries = transcript_obj.fetch()
-
-    except TranscriptsDisabled:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError:
         return None, PipelineError(
             stage="Transcript",
-            message="Субтитры отключены автором видео.",
+            message="Библиотека youtube-transcript-api не установлена.",
             recoverable=False,
         )
+
+    # Import exception classes (may vary by version)
+    try:
+        from youtube_transcript_api import TranscriptsDisabled, NoTranscriptFound
+    except ImportError:
+        TranscriptsDisabled = Exception
+        NoTranscriptFound = Exception
+
+    raw_entries = None
+
+    try:
+        # ─── Strategy 1: Direct fetch with language preference (works on all versions) ───
+        try:
+            raw_entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+        except Exception:
+            # English not available, try any language
+            try:
+                raw_entries = YouTubeTranscriptApi.get_transcript(video_id)
+            except Exception:
+                pass
+
+        # ─── Strategy 2: list_transcripts approach (older API style) ───
+        if raw_entries is None:
+            try:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                # Try manual English
+                transcript_obj = None
+                try:
+                    transcript_obj = transcript_list.find_manually_created_transcript(["en"])
+                except Exception:
+                    pass
+                # Try auto English
+                if not transcript_obj:
+                    try:
+                        transcript_obj = transcript_list.find_generated_transcript(["en"])
+                    except Exception:
+                        pass
+                # Try any available
+                if not transcript_obj:
+                    available = list(transcript_list)
+                    if available:
+                        transcript_obj = available[0]
+                if transcript_obj:
+                    raw_entries = transcript_obj.fetch()
+            except Exception:
+                pass
+
+        if not raw_entries:
+            return None, PipelineError(
+                stage="Transcript",
+                message="Субтитры не найдены или отключены для этого видео.",
+                recoverable=False,
+            )
+
     except Exception as e:
+        err_str = str(e)
+        if "disabled" in err_str.lower() or "TranscriptsDisabled" in err_str:
+            return None, PipelineError(
+                stage="Transcript",
+                message="Субтитры отключены автором видео.",
+                recoverable=False,
+            )
         return None, PipelineError(
             stage="Transcript",
-            message=f"Ошибка получения транскрипта: {str(e)[:200]}",
+            message=f"Ошибка получения транскрипта: {err_str[:200]}",
             recoverable=True,
         )
 
     # Format: [HH:MM:SS] Text
     lines = []
     for entry in raw_entries:
-        start_sec = int(entry["start"])
+        start_sec = int(entry.get("start", 0))
         h, m, s = start_sec // 3600, (start_sec % 3600) // 60, start_sec % 60
-        text = entry["text"].replace("\n", " ").strip()
-        lines.append(f"[{h:02d}:{m:02d}:{s:02d}] {text}")
+        text = entry.get("text", "").replace("\n", " ").strip()
+        if text:
+            lines.append(f"[{h:02d}:{m:02d}:{s:02d}] {text}")
+
+    if not lines:
+        return None, PipelineError(
+            stage="Transcript",
+            message="Транскрипт пуст — субтитры не содержат текста.",
+            recoverable=False,
+        )
 
     transcript_str = "\n".join(lines)
     return transcript_str, None
@@ -588,10 +623,7 @@ def render_sidebar() -> dict:
 
         st.markdown("---")
 
-        # --- API Keys (Revolver arrays) ---
-        st.markdown("### 🔑 API Keys (Револьвер)")
-        st.caption("По одному ключу на строку. При Quota Error — автоматическая ротация.")
-
+        # --- API Keys ---
         yt_keys_raw = st.text_area(
             "YouTube Data API v3",
             height=80,
@@ -626,9 +658,6 @@ def render_sidebar() -> dict:
             if count == 0:
                 cls = "revolver-dead"
                 icon = "⛔"
-            elif count == 1:
-                cls = "revolver-warn"
-                icon = "⚠️"
             else:
                 cls = "revolver-ok"
                 icon = "✅"
