@@ -207,9 +207,8 @@ def fetch_metadata(video_id: str, revolver: KeyRevolver) -> tuple[Optional[dict]
 
 def fetch_transcript(video_id: str) -> tuple[Optional[str], Optional[PipelineError]]:
     """
-    Fetch transcript with timecodes.
-    Supports both old (<=0.6.1) and new (>=0.6.2) versions of youtube-transcript-api.
-    Priority: English → any available language.
+    Fetch transcript with timecodes using robust multi-strategy fallback.
+    Priority: manual en → auto en → any language translated to en → any raw.
     Returns (formatted_transcript, None) or (None, PipelineError).
     """
     try:
@@ -221,7 +220,6 @@ def fetch_transcript(video_id: str) -> tuple[Optional[str], Optional[PipelineErr
             recoverable=False,
         )
 
-    # Import exception classes (may vary by version)
     try:
         from youtube_transcript_api import TranscriptsDisabled, NoTranscriptFound
     except ImportError:
@@ -231,61 +229,80 @@ def fetch_transcript(video_id: str) -> tuple[Optional[str], Optional[PipelineErr
     raw_entries = None
 
     try:
-        # ─── Strategy 1: Direct fetch with language preference (works on all versions) ───
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        # ─── Strategy 1: Find English transcript (manual or auto) ───
         try:
-            raw_entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+            transcript_obj = transcript_list.find_transcript(["en", "en-US", "en-GB"])
+            raw_entries = transcript_obj.fetch()
         except Exception:
-            # English not available, try any language
-            try:
-                raw_entries = YouTubeTranscriptApi.get_transcript(video_id)
-            except Exception:
-                pass
+            pass
 
-        # ─── Strategy 2: list_transcripts approach (older API style) ───
-        if raw_entries is None:
-            try:
-                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                # Try manual English
-                transcript_obj = None
-                try:
-                    transcript_obj = transcript_list.find_manually_created_transcript(["en"])
-                except Exception:
-                    pass
-                # Try auto English
-                if not transcript_obj:
-                    try:
-                        transcript_obj = transcript_list.find_generated_transcript(["en"])
-                    except Exception:
-                        pass
-                # Try any available
-                if not transcript_obj:
-                    available = list(transcript_list)
-                    if available:
-                        transcript_obj = available[0]
-                if transcript_obj:
-                    raw_entries = transcript_obj.fetch()
-            except Exception:
-                pass
-
+        # ─── Strategy 2: Manual transcript in any language → translate to English ───
         if not raw_entries:
-            return None, PipelineError(
-                stage="Transcript",
-                message="Субтитры не найдены или отключены для этого видео.",
-                recoverable=False,
-            )
+            try:
+                for tr in transcript_list:
+                    if not tr.is_generated:
+                        try:
+                            raw_entries = tr.translate("en").fetch()
+                            break
+                        except Exception:
+                            raw_entries = tr.fetch()
+                            break
+            except Exception:
+                pass
 
+        # ─── Strategy 3: Auto-generated in any language → translate to English ───
+        if not raw_entries:
+            try:
+                for tr in transcript_list:
+                    if tr.is_generated:
+                        try:
+                            raw_entries = tr.translate("en").fetch()
+                            break
+                        except Exception:
+                            raw_entries = tr.fetch()
+                            break
+            except Exception:
+                pass
+
+        # ─── Strategy 4: Take literally anything available ───
+        if not raw_entries:
+            try:
+                for tr in transcript_list:
+                    raw_entries = tr.fetch()
+                    break
+            except Exception:
+                pass
+
+    except TranscriptsDisabled:
+        return None, PipelineError(
+            stage="Transcript",
+            message="Субтитры отключены автором видео.",
+            recoverable=False,
+        )
     except Exception as e:
         err_str = str(e)
-        if "disabled" in err_str.lower() or "TranscriptsDisabled" in err_str:
+        if "disabled" in err_str.lower():
             return None, PipelineError(
                 stage="Transcript",
                 message="Субтитры отключены автором видео.",
                 recoverable=False,
             )
+        # Last resort: try simple get_transcript
+        try:
+            raw_entries = YouTubeTranscriptApi.get_transcript(video_id)
+        except Exception:
+            try:
+                raw_entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+            except Exception:
+                pass
+
+    if not raw_entries:
         return None, PipelineError(
             stage="Transcript",
-            message=f"Ошибка получения транскрипта: {err_str[:200]}",
-            recoverable=True,
+            message="Субтитры не найдены ни одним методом для этого видео.",
+            recoverable=False,
         )
 
     # Format: [HH:MM:SS] Text
@@ -595,8 +612,7 @@ def configure_page():
 def render_sidebar() -> dict:
     """Render sidebar with all settings. Returns config dict."""
     with st.sidebar:
-        st.markdown(f"## {APP_ICON} {APP_TITLE}")
-        st.markdown("---")
+        st.caption("Режиссёр-Аналитик v2.0")
 
         # --- LLM Provider ---
         st.markdown("### ⚡ LLM Provider")
